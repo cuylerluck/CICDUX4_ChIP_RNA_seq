@@ -1,0 +1,547 @@
+-------------------------------
+This document details the commands underlying our processing of the ChIP-seq data for our project. Written by Cuyler Luck.
+
+Contact Cuyler.Luck@ucsf.edu or Ross.Okimoto@ucsf.edu with questions.
+
+NOTE: Commands are based on paths used on my computer, so they may need to be adjusted for your own uses. Some insignificant commands such as moving files or deleting unnecessary files are not shown.
+
+All processing performed on a 2016 MacBook Pro with 16 GB RAM and a 2.9 GHz Quad-Core Intel Core i7 processor, using an external 1 TB Samsung T5 solid state drive.
+
+You may need to install particular tools on your own machine. Here are tools used with version numbers:
+
+Unix tools...
+bwa (0.7.17)
+fastqc (0.11.9)
+MultiQC (1.13)
+samtools (1.16.1)
+picard (2.27.5)
+MACS2 (2.2.7.1, from docker fooliu/macs2)
+bedtools (2.30.0)
+deeptools (3.5.1)
+R (4.2.2)
+
+R packages...
+data.table (1.14.8)
+ChIPseeker (1.34.1)
+dplyr (1.1.1)
+stringr (1.5.0)
+RColorBrewer (1.1-3)
+ggplot2 (3.4.1)
+spgs (1.0-3)
+pheatmap (1.0.12)
+ggrepel (0.9.3)
+
+
+Sample abbreviations:
+IgG = IgG
+CIC = CIC
+A1 = H3K4me1
+B2 = H3K27me3
+C3 = H3K4me3
+DAC = H3K27ac
+
+--------------------------------
+
+The human RefSeq GRCh38.p14 was first downloaded from NCBI, and then indexed...
+
+Downloaded reference genome RefSeq GRCh38.p14 from NCBI (https://www.ncbi.nlm.nih.gov/assembly/GCF_000001405.40)
+File name GCF_000001405.40_GRCh38.p14_genomic.fa (changed from .fna to .fa)
+
+Creating index for GRCh38:
+bwa index GCF_000001405.40_GRCh38.p14_genomic.fa
+
+
+---
+
+To simplify multi-input commands downstream, I created a list of all FASTQ sample names...
+
+find -L  . -name "*.fq.gz" -exec echo {} \; > samples.txt
+cat samples.txt | awk '{ print substr( $0, 1, length($0)-8 ) }' > samples2.txt
+cat samples2.txt | awk '{ print substr( $0, 12, length($0) ) }' | uniq > samples3.txt
+
+---
+
+I also generated FASTQC reports for all .fq.gz input files...
+
+xargs -I tmp echo fastqc raw_data/tmp_1.fq.gz < samples3.txt | sh
+xargs -I tmp echo fastqc raw_data/tmp_2.fq.gz < samples3.txt | sh
+
+---
+
+I then aligned the fastq files to the hg38 genome using bwa mem...
+
+xargs -I tmp echo bwa mem -t 8 -o hg38_alignments/sams/tmp.sam hg38_alignments/input/genome_assemblies_genome_fasta/ncbi-genomes-2022-11-18/GCF_000001405.40_GRCh38.p14_genomic.fa raw_data/tmp_1.fq.gz raw_data/tmp_2.fq.gz < samples3.txt | sh
+
+---
+
+And then converted the resulting .sam files to .bam files...
+
+xargs -I tmp echo samtools view -@ 8 -h -b -o hg38_alignments/bams/tmp_bwa.bam hg38_alignments/sams/tmp.sam < samples3.txt | sh
+
+---
+
+I then needed to sort the .bam files by name for duplicate marking...
+
+xargs -I tmp echo picard SortSam I=hg38_alignments/bams/tmp_bwa.bam O=hg38_alignments/bams/tmp_bwa_namesorted.bam SO=queryname < samples3.txt | sh
+
+---
+
+Picard was then used to mark duplicates...
+
+xargs -I tmp echo picard MarkDuplicates I=hg38_alignments/bams/tmp_bwa_namesorted.bam  O=hg38_alignments/bams/tmp_bwa_namesorted_mrkdup.bam ASSUME_SORT_ORDER=queryname METRICS_FILE=hg38_alignments/bams/tmp_bwa_mrkdupmetrics.txt QUIET=true COMPRESSION_LEVEL=0 VALIDATION_STRINGENCY=LENIENT < samples3.txt | sh
+
+---
+
+I then position-sorted the duplicate-marked .bam files so that they could be indexed...
+
+xargs -I tmp echo picard SortSam I=hg38_alignments/bams/tmp_bwa_namesorted_mrkdup.bam O=hg38_alignments/bams/tmp_bwa_dupMarked_possorted.bam SO=coordinate < samples3.txt | sh
+
+---
+
+And then indexed the duplicate-marked, position-sorted .bam files...
+
+xargs -I tmp echo picard BuildBamIndex I=hg38_alignments/bams/tmp_bwa_dupMarked_possorted.bam < samples3.txt | sh
+
+---
+
+For QC I also generated flagstat reports for all of the duplicate-marked, position-sorted .bam files. This didn't work well with xargs, so I wrote a small bash script and ran it.
+
+Script:
+
+input="$1"
+while IFS= read -r line
+do
+        prepath="hg38_alignments/bams/"
+        postpath="_bwa_dupMarked_possorted.bam"
+        echo $line
+        fullpath=${prepath}${line}${postpath}
+        flagstat_postpath="_bwa_dupMarked_possorted_flagstat.flagstat"
+        outpath=${prepath}${line}${flagstat_postpath}
+        samtools flagstat $fullpath > $outpath
+done <"$input"
+
+Command line:
+
+sh make_flagstat.sh samples3.txt 
+
+---
+
+At this point, fully processed files were moved into a "final" directory. This included duplicate-marked + position-sorted .bam/.bai files, .flagstat reports, and .txt reports from duplicate marking.
+
+---
+
+To keep additional QC data I also generated fastqc reports for the duplicate-marked, position-sorted .bam files.
+
+xargs -I tmp echo fastqc hg38_alignments/bams/final/tmp_bwa_dupmarked_possorted.bam < samples3.txt | sh
+
+---
+
+I then called peaks on the duplicate-marked, position-sorted .bam files using macs2 via docker.
+All samples were called with a q value cutoff of 0.1. 
+Mappable genome size was given as hs.
+Replicates were combined for peak calling.
+CIC, C3 (H3K4me3), and DAC (H3K27ac) were called with otherwise default settings.
+A1 (H3K4me1) and B2 (H3K27me3) were called with --broad enabled, and without --call-summits.
+Explicitly saying data is paired-end BAM files (-f BAMPE)
+And explicitly setting what should already be the default, to keep at most one duplicate (--keep-dup 1), which MACS2 determines on its own (i.e. doesn't just read bit 1028 flag)
+
+pwd=$PWD
+
+docker run -v $pwd/:$pwd/data/ fooliu/macs2 callpeak -t $pwd/data/CIC_1_bwa_dupMarked_possorted.bam $pwd/data/CIC_2_bwa_dupMarked_possorted.bam -c $pwd/data/IgG_1_bwa_dupMarked_possorted.bam $pwd/data/IgG_2_bwa_dupMarked_possorted.bam --call-summits -q 0.1 -n $pwd/data/CIC_IgG_q0.1_BAMPE -g hs -f BAMPE --keep-dup 1
+
+docker run -v $pwd/:$pwd/data/ fooliu/macs2 callpeak -t $pwd/data/A1_1_bwa_dupMarked_possorted.bam $pwd/data/A1_2_bwa_dupMarked_possorted.bam -c $pwd/data/IgG_1_bwa_dupMarked_possorted.bam $pwd/data/IgG_2_bwa_dupMarked_possorted.bam -q 0.1 -n $pwd/data/A1_IgG_q0.1_BAMPE -g hs --broad -f BAMPE --keep-dup 1
+
+docker run -v $pwd/:$pwd/data/ fooliu/macs2 callpeak -t $pwd/data/B2_1_bwa_dupMarked_possorted.bam $pwd/data/B2_2_bwa_dupMarked_possorted.bam -c $pwd/data/IgG_1_bwa_dupMarked_possorted.bam $pwd/data/IgG_2_bwa_dupMarked_possorted.bam -q 0.1 -n $pwd/data/B2_IgG_q0.1_BAMPE -g hs --broad -f BAMPE --keep-dup 1
+
+docker run -v $pwd/:$pwd/data/ fooliu/macs2 callpeak -t $pwd/data/C3_1_bwa_dupMarked_possorted.bam $pwd/data/C3_2_bwa_dupMarked_possorted.bam -c $pwd/data/IgG_1_bwa_dupMarked_possorted.bam $pwd/data/IgG_2_bwa_dupMarked_possorted.bam --call-summits -q 0.1 -n $pwd/data/C3_IgG_q0.1_BAMPE -g hs -f BAMPE --keep-dup 1
+
+docker run -v $pwd/:$pwd/data/ fooliu/macs2 callpeak -t $pwd/data/DAC_1_bwa_dupMarked_possorted.bam $pwd/data/DAC_2_bwa_dupMarked_possorted.bam -c $pwd/data/IgG_1_bwa_dupMarked_possorted.bam $pwd/data/IgG_2_bwa_dupMarked_possorted.bam --call-summits -q 0.1 -n $pwd/data/DAC_IgG_q0.1_BAMPE -g hs -f BAMPE --keep-dup 1
+
+---
+
+I then filtered the q0.1 called .narrowPeak and .broadPeak files further to q0.01 and 0.001 using awk.
+
+
+cat CIC_IgG_q0.1_BAMPE_peaks.narrowPeak | awk '{ if($9 > 2) { print } }' > CIC_IgG_filt_q0.01_peaks.narrowPeak
+
+cat A1_IgG_q0.1_BAMPE_peaks.broadPeak | awk '{ if($9 > 2) { print } }' > A1_IgG_filt_q0.01_peaks.broadPeak
+
+cat B2_IgG_q0.1_BAMPE_peaks.broadPeak | awk '{ if($9 > 2) { print } }' > B2_IgG_filt_q0.01_peaks.broadPeak
+
+cat C3_IgG_q0.1_BAMPE_peaks.narrowPeak | awk '{ if($9 > 2) { print } }' > C3_IgG_filt_q0.01_peaks.narrowPeak
+
+cat DAC_IgG_q0.1_BAMPE_peaks.narrowPeak | awk '{ if($9 > 2) { print } }' > DAC_IgG_filt_q0.01_peaks.narrowPeak
+
+
+cat CIC_IgG_q0.1_BAMPE_peaks.narrowPeak | awk '{ if($9 > 3) { print } }' > CIC_IgG_filt_q0.001_peaks.narrowPeak
+
+cat A1_IgG_q0.1_BAMPE_peaks.broadPeak | awk '{ if($9 > 3) { print } }' > A1_IgG_filt_q0.001_peaks.broadPeak
+
+cat B2_IgG_q0.1_BAMPE_peaks.broadPeak | awk '{ if($9 > 3) { print } }' > B2_IgG_filt_q0.001_peaks.broadPeak
+
+cat C3_IgG_q0.1_BAMPE_peaks.narrowPeak | awk '{ if($9 > 3) { print } }' > C3_IgG_filt_q0.001_peaks.narrowPeak
+
+cat DAC_IgG_q0.1_BAMPE_peaks.narrowPeak | awk '{ if($9 > 3) { print } }' > DAC_IgG_filt_q0.001_peaks.narrowPeak
+
+
+---
+
+I then used bedtools to identify CIC q0.001 peaks within 1000bp of a DAC (H3K27ac) peak...
+
+bedtools window -a CIC_IgG_filt_q0.001_peaks.narrowPeak -b DAC_IgG_filt_q0.001_peaks.narrowPeak > CIC_IgG_q0.001_window_DAC.bed
+
+---
+
+And the same but within 1000bp of a C3 (H3K4me3) peak...
+
+bedtools window -a CIC_IgG_filt_q0.001_peaks.narrowPeak -b C3_IgG_filt_q0.001_peaks.narrowPeak > CIC_IgG_q0.001_window_C3.bed
+
+---
+
+I then combined these two peak lists (union) using cat...
+
+cat CIC_IgG_q0.001_window_DAC.bed > CIC_IgG_q0.001_DAC_C3_intersect.bed
+cat CIC_IgG_q0.001_window_C3.bed >> CIC_IgG_q0.001_DAC_C3_intersect.bed
+
+---
+
+And then sorted the combined peak list by unique CIC peak name to get rid of redundant overlapping peaks..
+Now this final list contains unique CIC q0.001 peaks within 1000bp of at least one of (a DAC [H3K27ac] or C3 [H3K4me3] peak)
+
+sort -u -k 4,4 CIC_IgG_q0.001_DAC_C3_intersect.bed > CIC_IgG_q0.001_DAC_C3_unique.bed
+
+---
+
+I next downloaded hg38 blacklisted regions from the Boyle-Lab github (https://github.com/Boyle-Lab/Blacklist/blob/master/lists/hg38-blacklist.v2.bed.gz)
+
+And to use this file (which names chromosomes as "chrZ") with my data (which names chromosomes with accessions) I used sed to replace the "chrZ" identifiers with their accessions as listed on the webpage I downloaded my genome file from (https://www.ncbi.nlm.nih.gov/assembly/GCF_000001405.40).
+This is not elegant, but works.
+
+sed 's/chr1\t/NC_000001.11\t/' hg38-blacklist.v2.bed > hg38-blacklist.v2.accessions.bed
+sed 's/chr2\t/NC_000002.12\t/' hg38-blacklist.v2.accessions.bed > hg38-blacklist.v2.accessions2.bed
+sed 's/chr3\t/NC_000003.12\t/' hg38-blacklist.v2.accessions2.bed > hg38-blacklist.v2.accessions3.bed
+sed 's/chr4\t/NC_000004.12\t/' hg38-blacklist.v2.accessions3.bed > hg38-blacklist.v2.accessions4.bed
+sed 's/chr5\t/NC_000005.10\t/' hg38-blacklist.v2.accessions4.bed > hg38-blacklist.v2.accessions5.bed
+sed 's/chr6\t/NC_000006.12\t/' hg38-blacklist.v2.accessions5.bed > hg38-blacklist.v2.accessions6.bed
+sed 's/chr7\t/NC_000007.14\t/' hg38-blacklist.v2.accessions6.bed > hg38-blacklist.v2.accessions7.bed
+sed 's/chr8\t/NC_000008.11\t/' hg38-blacklist.v2.accessions7.bed > hg38-blacklist.v2.accessions8.bed
+sed 's/chr9\t/NC_000009.12\t/' hg38-blacklist.v2.accessions8.bed > hg38-blacklist.v2.accessions9.bed
+sed 's/chr10\t/NC_000010.11\t/' hg38-blacklist.v2.accessions9.bed > hg38-blacklist.v2.accessions10.bed
+sed 's/chr11\t/NC_000011.10\t/' hg38-blacklist.v2.accessions10.bed > hg38-blacklist.v2.accessions11.bed
+sed 's/chr12\t/NC_000012.12\t/' hg38-blacklist.v2.accessions11.bed > hg38-blacklist.v2.accessions12.bed
+sed 's/chr13\t/NC_000013.11\t/' hg38-blacklist.v2.accessions12.bed > hg38-blacklist.v2.accessions13.bed
+sed 's/chr14\t/NC_000014.9\t/' hg38-blacklist.v2.accessions13.bed > hg38-blacklist.v2.accessions14.bed
+sed 's/chr15\t/NC_000015.10\t/' hg38-blacklist.v2.accessions14.bed > hg38-blacklist.v2.accessions15.bed
+sed 's/chr16\t/NC_000016.10\t/' hg38-blacklist.v2.accessions15.bed > hg38-blacklist.v2.accessions16.bed
+sed 's/chr17\t/NC_000017.11\t/' hg38-blacklist.v2.accessions16.bed > hg38-blacklist.v2.accessions17.bed
+sed 's/chr18\t/NC_000018.10\t/' hg38-blacklist.v2.accessions17.bed > hg38-blacklist.v2.accessions18.bed
+sed 's/chr19\t/NC_000019.10\t/' hg38-blacklist.v2.accessions18.bed > hg38-blacklist.v2.accessions19.bed
+sed 's/chr20\t/NC_000020.11\t/' hg38-blacklist.v2.accessions19.bed > hg38-blacklist.v2.accessions20.bed
+sed 's/chr21\t/NC_000021.9\t/' hg38-blacklist.v2.accessions20.bed > hg38-blacklist.v2.accessions21.bed
+sed 's/chr22\t/NC_000022.11\t/' hg38-blacklist.v2.accessions21.bed > hg38-blacklist.v2.accessions22.bed
+sed 's/chrX\t/NC_000023.11\t/' hg38-blacklist.v2.accessions22.bed > hg38-blacklist.v2.accessions23.bed
+sed 's/chrY\t/NC_000024.10\t/' hg38-blacklist.v2.accessions23.bed > hg38-blacklist.v2.accessions24.bed
+
+---
+
+I then used bedtools to remove any of the current CIC peaks which overlapped a blacklisted region...
+
+bedtools intersect -v -a CIC_IgG_q0.001_DAC_C3_unique.bed -b hg38-blacklist.v2.accessions24.bed > CIC_IgG_q0.001_DAC_C3_unique_nonblacklisted.bed
+
+---
+
+And I further subset these peaks to those on chromosomes (not patches or other sequence types)...
+
+grep -v ^NT CIC_IgG_q0.001_DAC_C3_unique_nonblacklisted.bed >> CIC_IgG_q0.001_DAC_C3_unique_nonblacklisted_temp.bed
+
+grep -v ^NW CIC_IgG_q0.001_DAC_C3_unique_nonblacklisted_temp.bed >> CIC_IgG_q0.001_DAC_C3_unique_nonblacklisted_chromosomal.bed
+
+---
+
+For visualization in IGV, I combined duplicate-marked, position-sorted bam files into one file each and indexed them.
+
+samtools merge -@ 8 A1_1_bwa_dupMarked_possorted.bam A1_2_bwa_dupMarked_possorted.bam -o A1_bwa_final_combined.bam
+picard BuildBamIndex I=A1_bwa_final_combined.bam
+
+samtools merge -@ 8 B2_1_bwa_dupMarked_possorted.bam B2_2_bwa_dupMarked_possorted.bam -o B2_bwa_final_combined.bam
+picard BuildBamIndex I=B2_bwa_final_combined.bam
+
+samtools merge -@ 8 C3_1_bwa_dupMarked_possorted.bam C3_2_bwa_dupMarked_possorted.bam -o C3_bwa_final_combined.bam
+picard BuildBamIndex I=C3_bwa_final_combined.bam
+
+
+samtools merge -@ 8 DAC_1_bwa_dupMarked_possorted.bam DAC_2_bwa_dupMarked_possorted.bam -o DAC_bwa_final_combined.bam
+picard BuildBamIndex I=DAC_bwa_final_combined.bam
+
+samtools merge -@ 8 CIC_1_bwa_dupMarked_possorted.bam CIC_2_bwa_dupMarked_possorted.bam -o CIC_bwa_final_combined.bam
+picard BuildBamIndex I=CIC_bwa_final_combined.bam
+
+samtools merge -@ 8 IgG_1_bwa_dupMarked_possorted.bam IgG_2_bwa_dupMarked_possorted.bam -o IgG_bwa_final_combined.bam
+picard BuildBamIndex I=IgG_bwa_final_combined.bam
+
+---
+
+For peak annotation, I had to convert the chromosome names in CIC_IgG_q0.001_DAC_C3_unique_nonblacklisted_chromosomal.bed from accessions to "chrZ", which I did in R.
+I also saved versions of the accession-labelled and chr-labelled files that are truncated to just the first 6 columns (typical BED format) for use in downstream applications without worrying about additional columns from window interfering.
+
+This was done in an R script:
+
+ChIP_analysis_CICDUX4_Nov2022.R
+
+---
+
+Then HOMER was used for peak annotation using hg38. This requires installing homer, downloading hg38, and then running this line of code:
+
+annotatePeaks.pl CIC_IgG_q0.001_DAC_C3_unique_nonblacklisted_chromosomal_chrLabels_trunc.bed hg38 > CIC_IgG_q0.001_DAC_C3_unique_nonblacklisted_chromosomal_chrLabels_trunc_HOMER.txt
+
+---
+
+I then used deeptools to generate BigWig files for my replicate-combined final .bam files from earlier to use in IGV and other deeptools visualizations.
+This included normalizing to 1x coverage (via RPGC normalization) using the effective genome size for GRCh38 (hg38) given on the documentation website (https://deeptools.readthedocs.io/en/develop/content/tools/bamCoverage.html).
+Reads were extended (-e).
+Duplicates were ignored.
+Bin size = 25.
+Excluded hg38 blacklisted regions.
+
+bamCoverage --bam CIC_bwa_final_combined.bam -o CIC_bwa_final_combined.bw --binSize 25 -e --ignoreDuplicates --normalizeUsing RPGC --effectiveGenomeSize 2913022398 -p max -v --bl hg38-blacklist.v2.accessions24.bed
+
+bamCoverage --bam IgG_bwa_final_combined.bam -o IgG_bwa_final_combined.bw --binSize 25 -e --ignoreDuplicates --normalizeUsing RPGC --effectiveGenomeSize 2913022398 -p max -v --bl hg38-blacklist.v2.accessions24.bed
+
+bamCoverage --bam A1_bwa_final_combined.bam -o A1_bwa_final_combined.bw --binSize 25 -e --ignoreDuplicates --normalizeUsing RPGC --effectiveGenomeSize 2913022398 -p max -v --bl hg38-blacklist.v2.accessions24.bed
+
+bamCoverage --bam B2_bwa_final_combined.bam -o B2_bwa_final_combined.bw --binSize 25 -e --ignoreDuplicates --normalizeUsing RPGC --effectiveGenomeSize 2913022398 -p max -v --bl hg38-blacklist.v2.accessions24.bed
+
+bamCoverage --bam C3_bwa_final_combined.bam -o C3_bwa_final_combined.bw --binSize 25 -e --ignoreDuplicates --normalizeUsing RPGC --effectiveGenomeSize 2913022398 -p max -v --bl hg38-blacklist.v2.accessions24.bed
+
+bamCoverage --bam DAC_bwa_final_combined.bam -o DAC_bwa_final_combined.bw --binSize 25 -e --ignoreDuplicates --normalizeUsing RPGC --effectiveGenomeSize 2913022398 -p max -v --bl hg38-blacklist.v2.accessions24.bed
+
+
+
+---
+
+I also used deeptools to generate a matrix comparing all of the original (uncombined) duplicate-marked, position-sorted .bam files to each other for QC purposes.
+
+multiBamSummary bins --bamfiles A1_1_bwa_dupMarked_possorted.bam A1_2_bwa_dupMarked_possorted.bam B2_1_bwa_dupMarked_possorted.bam B2_2_bwa_dupMarked_possorted.bam C3_1_bwa_dupMarked_possorted.bam C3_2_bwa_dupMarked_possorted.bam CIC_1_bwa_dupMarked_possorted.bam CIC_2_bwa_dupMarked_possorted.bam DAC_1_bwa_dupMarked_possorted.bam DAC_2_bwa_dupMarked_possorted.bam IgG_1_bwa_dupMarked_possorted.bam IgG_2_bwa_dupMarked_possorted.bam -o dupMarked_possorted_comparison.npz --labels A1_1 A1_2 B2_1 B2_2 C3_1 C3_2 CIC_1 CIC_2 DAC_1 DAC_2 IgG_1 IgG_2
+
+---
+
+I then plotted correlations (heatmap + scatterplot) and a PCA for the comparison of all individual replicate .bam files...
+Correlations calculated using Pearson.
+Outliers removed for heatmap and scatter plot.
+PCA performed with transposed, log2 transformed data using all possible features.
+
+plotCorrelation -in dupMarked_possorted_comparison.npz --corMethod pearson -p heatmap --removeOutliers -o bam_heatmap.svg -T Pearson 
+
+plotCorrelation -in dupMarked_possorted_comparison.npz --corMethod pearson -p scatterplot --removeOutliers -o bam_scatter.png -T Pearson 
+
+plotPCA -in dupMarked_possorted_comparison.npz -o bam_PCA.png -T "PCA of BAM Files" --transpose --ntop 0 --log2
+
+---
+
+Next, I generated a matrix of all BigWig file signals in a 5000bp window centered on the middle of the final CIC peaks (n=392) from CIC_IgG_q0.001_DAC_C3_unique_nonblacklisted_chromosomal_trunc.bed.
+
+computeMatrix reference-point -R CIC_IgG_q0.001_DAC_C3_unique_nonblacklisted_chromosomal_trunc.bed -S CIC_bwa_final_combined.bw DAC_bwa_final_combined.bw A1_bwa_final_combined.bw C3_bwa_final_combined.bw B2_bwa_final_combined.bw IgG_bwa_final_combined.bw -o CIC_peak_centered_matrix_5000bpwide.gz -a 2500 -b 2500 --samplesLabel CIC H3K27ac H3K4me1 H3K4me3 H3K27me3 IgG --referencePoint "center"
+
+
+
+---
+
+Then I plotted a heatmap of the above matrix (representing signal at all 392 CIC final peaks).
+Sorted using descending mean H3K27Ac signal.
+Defined heatmap color scale maxima and colors.
+
+plotHeatmap -m CIC_peak_centered_matrix_5000bpwide.gz -o CIC_peak_centered_matrix_5000bpwide_heatmap.png --sortRegions descend --sortUsing mean --sortUsingSamples 2 --refPointLabel "peak" --verbose --colorMap Blues Reds Greens Oranges Purples Greys -min auto -max 20 150 20 50 20 20 --averageTypeSummaryPlot "mean"
+
+
+
+---
+
+I also used grep to subset the HOMER-annotated CIC peaks to just those that were annotated to be in promoters or intergenic.
+
+grep promoter CIC_IgG_q0.001_DAC_C3_unique_nonblacklisted_chromosomal_chrLabels_trunc_HOMER.txt > CIC_IgG_q0.001_DAC_C3_unique_nonblacklisted_chromosomal_chrLabels_trunc_HOMER_promoters.bed
+
+grep Intergenic CIC_IgG_q0.001_DAC_C3_unique_nonblacklisted_chromosomal_chrLabels_trunc_HOMER.txt > CIC_IgG_q0.001_DAC_C3_unique_nonblacklisted_chromosomal_chrLabels_trunc_HOMER_intergenic.bed
+
+---
+
+Then to get these same peaks but with chromosomes labelled with accessions instead of "chrZ", I used R again.
+
+ChIP_promoter_intergenic_CICDUX4_Nov2022.R
+
+---
+
+Then similar to above, I generated matrices and plotted heatmaps for 5000bp-wide intervals centered on the center of CIC peaks, but broken down into only promoter-annotated or intergenic-annotated CIC peaks.
+Sorted using descending mean H3K27Ac signal.
+Defined heatmap color scale maxima and colors.
+
+computeMatrix reference-point -R CIC_IgG_q0.001_DAC_C3_unique_nonblacklisted_chromosomal_trunc_promoters.bed -S CIC_bwa_final_combined.bw DAC_bwa_final_combined.bw A1_bwa_final_combined.bw C3_bwa_final_combined.bw B2_bwa_final_combined.bw IgG_bwa_final_combined.bw -o CIC_peak_centered_matrix_5000bpwide_promoters.gz -a 2500 -b 2500 --samplesLabel CIC H3K27ac H3K4me1 H3K4me3 H3K27me3 IgG --referencePoint "center"
+
+
+computeMatrix reference-point -R CIC_IgG_q0.001_DAC_C3_unique_nonblacklisted_chromosomal_trunc_intergenic.bed -S CIC_bwa_final_combined.bw DAC_bwa_final_combined.bw A1_bwa_final_combined.bw C3_bwa_final_combined.bw B2_bwa_final_combined.bw IgG_bwa_final_combined.bw -o CIC_peak_centered_matrix_5000bpwide_intergenic.gz -a 2500 -b 2500 --samplesLabel CIC H3K27ac H3K4me1 H3K4me3 H3K27me3 IgG --referencePoint "center"
+
+
+plotHeatmap -m CIC_peak_centered_matrix_5000bpwide_promoters.gz -o CIC_peak_centered_matrix_5000bpwide_promoters_heatmap.png --sortRegions descend --sortUsing mean --sortUsingSamples 2 --refPointLabel "peak" --verbose --colorMap Blues Reds Greens Oranges Purples Greys -min auto -max 20 150 20 50 20 20 --averageTypeSummaryPlot "mean"
+
+plotHeatmap -m CIC_peak_centered_matrix_5000bpwide_intergenic.gz -o CIC_peak_centered_matrix_5000bpwide_intergenic_heatmap.png --sortRegions descend --sortUsing mean --sortUsingSamples 2 --refPointLabel "peak" --verbose --colorMap Blues Reds Greens Oranges Purples Greys -min auto -max 20 150 20 50 20 20 --averageTypeSummaryPlot "mean"
+
+
+---
+
+I also generated accompanying profile plots for the bulk, promoter-only, and intergenic-only 5000bp windows around CIC peaks.
+Manually defined yMax values. They are the same for promoter/intergenic, but different for bulk.
+
+plotProfile -m CIC_peak_centered_matrix_5000bpwide.gz -o CIC_peak_centered_matrix_5000bpwide_profile.png --refPointLabel "peak" --colors blue red green orange purple grey --averageType mean --yMin 0 --yMax 20 35 20 20 20 20
+
+plotProfile -m CIC_peak_centered_matrix_5000bpwide_promoters.gz -o CIC_peak_centered_matrix_5000bpwide_promoters_profile.png --refPointLabel "peak" --colors blue red green orange purple grey --averageType mean --yMin 0 --yMax 40 150 40 70 40 40
+
+plotProfile -m CIC_peak_centered_matrix_5000bpwide_intergenic.gz -o CIC_peak_centered_matrix_5000bpwide_intergenic_profile.png --refPointLabel "peak" --colors blue red green orange purple grey --averageType mean --yMin 0 --yMax 40 150 40 70 40 40
+
+
+
+---
+
+To show that there is in fact H3K27me3 signal/peaks, I first removed any peaks overlapping blacklisted regions from the list of q0.001 H3K27me3 peaks.
+
+bedtools intersect -v -a B2_IgG_filt_q0.001_peaks.broadPeak -b hg38-blacklist.v2.accessions24.bed > B2_IgG_filt_q0.001_peaks_noBlacklist.bed
+
+---
+
+Then as above I computed a 5000bp wide matrix around the center of these H3K27me3 peaks.
+
+computeMatrix reference-point -R B2_IgG_filt_q0.001_peaks_noBlacklist.bed -S CIC_bwa_final_combined.bw DAC_bwa_final_combined.bw A1_bwa_final_combined.bw C3_bwa_final_combined.bw B2_bwa_final_combined.bw IgG_bwa_final_combined.bw -o B2_peak_centered_matrix_5000bpwide.gz -a 2500 -b 2500 --samplesLabel CIC H3K27ac H3K4me1 H3K4me3 H3K27me3 IgG --referencePoint "center"
+
+
+---
+
+And then plotted a heatmap and profile plot based on this matrix.
+Manually defined max/yMax values.
+Heatmap sorted using descending mean H3K27me3 signal.
+
+plotHeatmap -m B2_peak_centered_matrix_5000bpwide.gz -o B2_peak_centered_matrix_5000bpwide_heatmap.png --sortRegions descend --sortUsing mean --sortUsingSamples 5 --refPointLabel "peak" --verbose --colorMap Blues Reds Greens Oranges Purples Greys -min auto -max 20 150 20 50 20 20 auto --averageTypeSummaryPlot "mean"
+
+plotProfile -m B2_peak_centered_matrix_5000bpwide.gz -o B2_peak_centered_matrix_5000bpwide_profile.png --refPointLabel "peak" --colors blue red green orange purple grey --averageType mean --yMin 0 --yMax 20 35 20 20 20 20
+
+
+---
+
+I then made a coverage plot of the final 392 CIC peaks across the genome. Also made a pie chart of the distribution of peak locations in genetic elements. And exported a list of HOMER annotated unique gene symbols for external GO analysis.
+
+This was done in R:
+ChIP_gene_ontology_CICDUX4_Nov2022.R
+
+---
+
+Next I wanted to extract 500bp sequenced centered on the middle of CIC peaks for use in MEME-ChIP motif identification.
+First I determined the center of CIC peaks using awk. Print the "name" in the fourth column as the concatenated first three columns. This will help eliminate to uniques later (because some peaks that have multiple summits will represent the same genomic area, and this could matter for statistics, I would prefer to be conservative here and not multiply-count summits in the same genomic region).
+
+awk '{print$1,int(($3+$2)/2)-250,int(($3+$2)/2)+250,$1$2$3}' OFS='\t' CIC_IgG_q0.001_DAC_C3_unique_nonblacklisted_chromosomal_trunc.bed > CIC_IgG_q0.001_DAC_C3_unique_nonblacklisted_chromosomal_trunc_500bp_around_center.bed
+
+---
+
+Next, reduce this to only unique genomic regions using sort. This takes us from 392 regions to 374.
+
+sort CIC_IgG_q0.001_DAC_C3_unique_nonblacklisted_chromosomal_trunc_500bp_around_center.bed -uk4 > CIC_IgG_q0.001_DAC_C3_unique_nonblacklisted_chromosomal_trunc_500bp_around_center_unique.bed
+
+---
+
+Finally, get FASTA sequence at these coordinates using bedtools.
+
+bedtools getfasta -fi /Volumes/cuyler/ucsf_okimoto_lab/nick_chipseq_project/hg38_alignments/input/genome_assemblies_genome_fasta/ncbi-genomes-2022-11-18/GCF_000001405.40_GRCh38.p14_genomic.fa -bed CIC_IgG_q0.001_DAC_C3_unique_nonblacklisted_chromosomal_trunc_500bp_around_center_unique.bed -fo CIC_IgG_q0.001_DAC_C3_unique_nonblacklisted_chromosomal_trunc_500bp_around_center_unique_FASTA.fa -nameOnly
+
+---
+
+Then use this as input into MEME-ChIP on the web browser with default inputs. Use human DNA & HOCOMOCO Human (V11 CORE) plus otherwise default options. Classic mode.
+
+https://meme-suite.org/meme/tools/meme-chip
+Result file: MEME-ChIP Results.html
+
+---
+
+Used DAVID web tool for gene ontology analysis.
+
+https://david.ncifcrf.gov/tools.jsp
+
+Uploaded CIC_IgG_q0.001_DAC_C3_unique_nonblacklisted_chromosomal_chrLabels_trunc_HOMER_unique_genes.txt as the gene list.
+Choose OFFICIAL_GENE_SYMBOL
+Homo sapiens as species.
+Gene List as list type.
+Choose functional annotation tool.
+Leave defaults selected.
+Choose Functional Annotation Chart.
+Download file as CIC_IgG_q0.001_DAC_C3_unique_nonblacklisted_chromosomal_chrLabels_trunc_HOMER_unique_genes_DAVID.txt
+Open in Excel
+Sort by lowest --> highest FDR.
+
+---
+
+
+
+I also want the full FASTA sequences from peaks, not just 500 bp centered around the center.
+We can use the file CIC_IgG_q0.001_DAC_C3_unique_nonblacklisted_chromosomal_trunc.bed which contains coordinates for the peaks.
+
+First, get only unique genomic regions by making a fourth column after the required first three which is the chromosome, start, and end concatenated:
+
+awk '{print$1,$2,$3,$1$2$3}' OFS='\t' CIC_IgG_q0.001_DAC_C3_unique_nonblacklisted_chromosomal_trunc.bed > CIC_IgG_q0.001_DAC_C3_unique_nonblacklisted_chromosomal_trunc_uniqFourth.bed
+
+Then, sort on the fourth column to just keep unique genomic regions:
+
+sort CIC_IgG_q0.001_DAC_C3_unique_nonblacklisted_chromosomal_trunc_uniqFourth.bed -uk4 > CIC_IgG_q0.001_DAC_C3_unique_nonblacklisted_chromosomal_trunc_uniqFourth_unique.bed
+
+This correctly reduces the number of peaks to 374 from 392. This is because some summits share the same genomic coordinates, and I don't want to include those for statistics since they're really the same broader peak spanning the same genomic region.
+
+Then, use bedtools to extract FASTA at these coordinates from the reference genome
+
+bedtools getfasta -fi /Volumes/cuyler/ucsf_okimoto_lab/nick_chipseq_project/hg38_alignments/input/genome_assemblies_genome_fasta/ncbi-genomes-2022-11-18/GCF_000001405.40_GRCh38.p14_genomic.fa -bed CIC_IgG_q0.001_DAC_C3_unique_nonblacklisted_chromosomal_trunc_uniqFourth_unique.bed -fo CIC_IgG_q0.001_DAC_C3_unique_nonblacklisted_chromosomal_trunc_uniqFourth_unique_fullPeak_FASTA.fasta -nameOnly
+
+Now, these sequences spanning the entirety of peaks can be analyzed for recurring DNA motifs in R (see motif_analysis.R).
+
+
+
+
+---------
+
+I'm also interested in seeing how many q < 0.001 CIC peaks that are unique, non-blacklisted, and chromosomal are NOT within 1kb of an activating mark. So I will do something very similar to how I derived the list of peaks near activating marks, but using -v in the window command to only keep peaks that are NOT within 1kb of an activating mark.
+
+--
+
+
+I will use bedtools to identify CIC q0.001 peaks NOT within 1000bp of a DAC (H3K27ac) peak...
+
+bedtools window -v -a CIC_IgG_filt_q0.001_peaks.narrowPeak -b DAC_IgG_filt_q0.001_peaks.narrowPeak > CIC_IgG_q0.001_not_window_DAC.bed
+
+---
+
+And add the restriction that it also must NOT be within 1000bp of a C3 (H3K4me3) peak...
+
+bedtools window -v -a CIC_IgG_q0.001_not_window_DAC.bed -b C3_IgG_filt_q0.001_peaks.narrowPeak > CIC_IgG_q0.001_not_window_DAC_C3.bed
+
+
+---
+
+Sort the resulting peak list by unique CIC peak name to get rid of redundant overlapping peaks..
+
+sort -u -k 4,4 CIC_IgG_q0.001_not_window_DAC_C3.bed > CIC_IgG_q0.001_not_window_DAC_C3_unique.bed
+
+
+--
+
+Now keep only non-blacklisted peaks...
+
+bedtools intersect -v -a CIC_IgG_q0.001_not_window_DAC_C3_unique.bed -b hg38-blacklist.v2.accessions24.bed > CIC_IgG_q0.001_not_window_DAC_C3_unique_nonblacklisted.bed
+
+--
+
+Then, keep only peaks that are chromosomal (not on scaffolds or mitochondrial).
+
+grep -v ^NT CIC_IgG_q0.001_not_window_DAC_C3_unique_nonblacklisted.bed >> CIC_IgG_q0.001_not_window_DAC_C3_unique_nonblacklisted_temp.bed
+
+grep -v ^NW CIC_IgG_q0.001_not_window_DAC_C3_unique_nonblacklisted_temp.bed >> CIC_IgG_q0.001_not_window_DAC_C3_unique_nonblacklisted_chromosomal.bed
+
+
+This gets us to only 61 peaks that are q < 0.001, unique, nonblacklisted, and chromosomal, but are NOT within 1kb of an activating mark.
+
+
+---------
+
+
+
