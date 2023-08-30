@@ -86,7 +86,7 @@ x1_results = dplyr::mutate(x1_results, neglog10_p_fdr_adj = -log10(p_fdr_adj))
 
 #ensembl = useEnsembl(biomart = "ensembl")
 #listDatasets(ensembl) #this shows that at the time of analysis, the 'hsapiens_gene_ensembl' dataset is for GRCh38.p13 which is the same version I used to align to.
-ensembl = useEnsembl(biomart="ensembl", dataset='hsapiens_gene_ensembl')
+ensembl = useEnsembl(biomart="ensembl", dataset='hsapiens_gene_ensembl', mirror = "uswest")
 
 #listFilters(ensembl) #I will filter by ensembl_gene_id
 #listAttributes(ensembl) #I will retrieve hgnc_symbol and ensembl_gene_id
@@ -122,7 +122,7 @@ watson = fread("watson_biorxiv_genes.tsv", header = F)
 
 #These cutoffs are:
 # -log10(q) value line is drawn at 4, which is 0.0001
-# log2FC cutoff lines are drawn at +/0 0.58, which is approx. 0.66 & 1.5 FC
+# log2FC cutoff lines are drawn at +/- 0.58, which is approx. 0.66 & 1.5 FC
 
 #this plot colors CIC red and the genes from Watson gold
 pdf(file = "plots/X1.watsongenes.pdf", width = 4, height = 4)
@@ -561,10 +561,44 @@ intersect = down_genes[down_genes %in% chip_peaks$V1]
 write.table(intersect, file = "intersect_genes.txt", quote = F, col.names = F, row.names = F)
 
 
+#Just to have it, also making DFs of genes significantly upregulated in both cell lines
+X1_up = x1_symbol_results[x1_symbol_results$logFC > -0.58 & x1_symbol_results$neglog10_p_fdr_adj > 4,]
+CDS2_up = cds2_symbol_results[cds2_symbol_results$logFC > -0.58 & cds2_symbol_results$neglog10_p_fdr_adj > 4,]
 
 
 
+#We also want to plot the log2(cpm+2) values for SPRED1 expression in X1 cells.
+#Need to pivot the data to do this, but first let's subset to just SPRED1.
+#The ENSG ID for SPRED1 is ENSG00000166068
 
+x1_spred1 = x1_logcpm_df[x1_logcpm_df$ENSG_ID == "ENSG00000166068",]
 
+#pivot & make a variable to help color by siRNA condition
+x1_spred1_pivot = pivot_longer(x1_spred1, cols = c(2:5), values_to = "logcpm", names_to = "sample")
+x1_spred1_pivot = dplyr::mutate(x1_spred1_pivot, Condition = ifelse(sample %in% c("X1_scrm1","X1_scrm2"), "Control", "siCIC"))
+
+#plot
+pdf(file = "plots/x1_spred1_zoomout.pdf", width = 4, height = 6)
+ggplot(data = x1_spred1_pivot, aes(x = Condition, y = logcpm, fill = Condition)) +
+  stat_summary(fun = "mean", geom = "bar") +
+  geom_point(size = 4) +
+  theme_classic() +
+  coord_cartesian(ylim = c(0, 10)) +
+  scale_fill_manual(values = c("Gray","Pink")) +
+  theme(axis.title = element_text(size = 16), axis.text = element_text(size = 14)) +
+  ylab("log2(cpm+2)")
+dev.off()
+
+pdf(file = "plots/x1_spred1_zoomin.pdf", width = 4, height = 6)
+ggplot(data = x1_spred1_pivot, aes(x = Condition, y = logcpm, fill = Condition)) +
+  stat_summary(fun = "mean", geom = "bar") +
+  geom_point(size = 4) +
+  theme_classic() +
+  coord_cartesian(ylim = c(7, 8.5)) +
+  scale_fill_manual(values = c("Gray","Pink"))+
+  theme(axis.title = element_text(size = 16), axis.text = element_text(size = 14))+
+  ylab("log2(cpm+2)")
+dev.off()
+  
 
 
